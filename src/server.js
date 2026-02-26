@@ -1,15 +1,22 @@
+// server.js
 const express = require("express");
 const cors = require("cors")
 const { PrismaClient } = require("@prisma/client");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const { OAuth2Client } = require("google-auth-library");
 require("dotenv").config();
 
 const prisma = new PrismaClient();
 const app = express();
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 app.use(cors());
 app.use(express.json());
+
+// JWT Secret - should be in .env
+const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key-change-in-production";
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || "your-refresh-secret-key-change-in-production";
 
 const authMiddleware = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -28,6 +35,132 @@ const authMiddleware = (req, res, next) => {
     return res.status(401).json({ error: "Token inválido" });
   }
 };
+
+// Helper to generate tokens
+function generateTokens(userId) {
+  const accessToken = jwt.sign({ userId }, JWT_SECRET, { expiresIn: "1h" });
+  const refreshToken = jwt.sign({ userId }, JWT_REFRESH_SECRET, { expiresIn: "7d" });
+  return { accessToken, refreshToken };
+}
+
+// Auth endpoints for mobile OAuth
+app.post("/auth/google/mobile", async (req, res) => {
+  console.log("[AUTH] Google auth request received");
+  console.log("[AUTH] GOOGLE_CLIENT_ID:", process.env.GOOGLE_CLIENT_ID ? "SET" : "NOT SET");
+  
+  try {
+    const { idToken } = req.body;
+    console.log("[AUTH] idToken present:", !!idToken);
+
+    if (!idToken) {
+      return res.status(400).json({ error: "ID token requerido" });
+    }
+
+    const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+    if (!CLIENT_ID) {
+      console.error("[AUTH] ERROR: GOOGLE_CLIENT_ID not in .env");
+      return res.status(500).json({ error: "Server misconfigured" });
+    }
+
+    // Verify Google ID token
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    console.log("[AUTH] Google payload email:", payload?.email);
+    
+    const { sub: googleId, email, name, picture } = payload;
+
+    if (!email) {
+      return res.status(400).json({ error: "Email no disponible de Google" });
+    }
+
+    // Find or create user
+    let user = await prisma.user.findUnique({
+      where: { email },
+    });
+
+    if (!user) {
+      console.log("[AUTH] Creating new user for:", email);
+      user = await prisma.user.create({
+        data: {
+          username: name?.replace(/\s+/g, "_").toLowerCase() + "_" + googleId.slice(0, 8) || email.split("@")[0],
+          email,
+          password: null,
+          avatarUrl: picture || null,
+        },
+      });
+    } else {
+      console.log("[AUTH] Found existing user:", user.id);
+    }
+
+    // Generate tokens
+    const { accessToken, refreshToken } = generateTokens(user.id);
+
+    const response = {
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.username,
+        avatarUrl: user.avatarUrl,
+      },
+      accessToken,
+      refreshToken,
+      expiresIn: 3600,
+    };
+    
+    console.log("[AUTH] Success! Sending response");
+    res.json(response);
+
+  } catch (error) {
+    console.error("[AUTH] Error:", error.message);
+    res.status(401).json({ error: "Google auth failed: " + error.message });
+  }
+});
+
+// Refresh token endpoint
+app.post("/auth/refresh", async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+
+    if (!refreshToken) {
+      return res.status(400).json({ error: "Refresh token requerido" });
+    }
+
+    // Verify refresh token
+    const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+
+    // Check if user still exists
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.userId },
+    });
+
+    if (!user) {
+      return res.status(401).json({ error: "Usuario no encontrado" });
+    }
+
+    // Generate new tokens
+    const tokens = generateTokens(user.id);
+
+    res.json({
+      accessToken: tokens.accessToken,
+      expiresIn: 3600, // 1 hour in seconds
+    });
+
+  } catch (error) {
+    console.error("Token refresh error:", error);
+    res.status(401).json({ error: "Token de refresh inválido" });
+  }
+});
+
+// Logout endpoint
+app.post("/auth/logout", async (req, res) => {
+  // For JWT-based auth, we don't need to do anything server-side
+  // The client will discard the tokens
+  res.json({ message: "Logout exitoso" });
+});
 
 // Ruta de prueba
 app.get("/", (req, res) => {

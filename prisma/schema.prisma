@@ -36,7 +36,7 @@ model User {
   id          String     @id @default(uuid())
   username    String     @unique
   email       String     @unique
-  password    String
+  password    String?    // Optional for OAuth users
   bio         String?
   avatarUrl   String?
   createdAt   DateTime   @default(now())
